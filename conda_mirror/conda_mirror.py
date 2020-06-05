@@ -28,6 +28,13 @@ DEFAULT_PLATFORMS = ['linux-64',
                      'win-64',
                      'win-32']
 
+PACKAGE_FORMATS = ['packages', 'packages.conda']
+PACKAGE_FORMAT_EXTS = {'packages': '.tar.bz2',
+                       'packages.conda': '.conda'}
+
+# Put a check here to ensure that the above don't get modified out of sync
+assert(sorted(PACKAGE_FORMATS) == sorted(list(PACKAGE_FORMAT_EXTS.keys())))
+
 
 def _maybe_split_channel(channel):
     """Split channel if it is fully qualified.
@@ -76,35 +83,40 @@ def _match(all_packages, key_glob_dict):
 
     Parameters
     ----------
-    all_packages : iterable
-        Iterable of package metadata dicts from repodata.json
-    key_glob_dict : iterable of kv pairs
-        Iterable of (key, glob_value) dicts
+    all_packages : dict
+        dict with keys in PACKAGE_FORMATS.
+        Values are iterables of package metadata dicts from repodata.json
+    key_glob_dict : dict
+        dict with keys in PACKAGE_FORMATS. Values are iterables of (key, glob_value) dicts
 
     Returns
     -------
     matched : dict
-        Iterable of package metadata dicts which match the `target_packages`
+        dict with keys in PACKAGE_FORMATS.
+        Values are Iterables of package metadata dicts which match the `target_packages`
         (key, glob_value) tuples
 
     """
-    matched = dict()
-    key_glob_dict = {key.lower(): glob.lower()
-                     for key, glob
-                     in key_glob_dict.items()}
-    for pkg_name, pkg_info in all_packages.items():
-        matched_all = []
-        # normalize the strings so that comparisons are easier
-        for key, pattern in key_glob_dict.items():
-            name = str(pkg_info.get(key, '')).lower()
-            if fnmatch.fnmatch(name, pattern):
-                matched_all.append(True)
-            else:
-                matched_all.append(False)
-        if all(matched_all):
-            matched.update({pkg_name: pkg_info})
+    matched_dict = {}
+    for fmt in PACKAGE_FORMATS:
+        matched = {}
+        key_glob_dict = {key.lower(): glob.lower()
+                         for key, glob
+                         in key_glob_dict.items()}
+        for pkg_name, pkg_info in all_packages[fmt].items():
+            matched_all = []
+            # normalize the strings so that comparisons are easier
+            for key, pattern in key_glob_dict.items():
+                name = str(pkg_info.get(key, '')).lower()
+                if fnmatch.fnmatch(name, pattern):
+                    matched_all.append(True)
+                else:
+                    matched_all.append(False)
+            if all(matched_all):
+                matched.update({pkg_name: pkg_info})
+        matched_dict[fmt] = matched
 
-    return matched
+    return matched_dict
 
 
 def _str_or_false(x):
@@ -410,13 +422,17 @@ def _validate(filename, md5=None, size=None):
     if size and size != os.stat(filename).st_size:
         return _remove_package(filename, reason="Failed size test")
 
-    try:
-        with tarfile.open(filename) as t:
-            t.extractfile('info/index.json').read().decode('utf-8')
-    except (tarfile.TarError, EOFError):
-        logger.info("Validation failed because conda package is corrupted.",
-                    exc_info=True)
-        return _remove_package(filename, reason="Tarfile read failure")
+    if os.splitext(filename)[1] == PACKAGE_FORMAT_EXTS['packages.conda']:
+        # For now, don't try to extract the conda package if it fails the above checks
+        logger.info(f"Skipping tarbal extraction on {filename}. File may be corrupt.")
+    else:
+        try:
+            with tarfile.open(filename) as t:
+                t.extractfile('info/index.json').read().decode('utf-8')
+        except (tarfile.TarError, EOFError):
+            logger.info("Validation failed because conda package is corrupted.",
+                        exc_info=True)
+            return _remove_package(filename, reason="Tarfile read failure")
 
     return filename, None
 
@@ -439,7 +455,8 @@ def get_repodata(channel, platform, proxies=None, ssl_verify=None):
     -------
     info : dict
     packages : dict
-        keyed on package name (e.g., twisted-16.0.0-py35_0.tar.bz2)
+        Keys are fmts in PACKAGE_FORMATS.
+        Values are dicts keyed on package name (e.g., twisted-16.0.0-py35_0.tar.bz2)
     """
     url_template, channel = _maybe_split_channel(channel)
     url = url_template.format(channel=channel, platform=platform,
@@ -447,13 +464,16 @@ def get_repodata(channel, platform, proxies=None, ssl_verify=None):
 
     resp = requests.get(url, proxies=proxies, verify=ssl_verify).json()
     info = resp.get('info', {})
-    packages = resp.get('packages', {})
-    # Patch the repodata.json so that all package info dicts contain a "subdir"
-    # key.  Apparently some channels on anaconda.org do not contain the
-    # 'subdir' field. I think this this might be relegated to the
-    # Continuum-provided channels only, actually.
-    for pkg_name, pkg_info in packages.items():
-        pkg_info.setdefault('subdir', platform)
+    packages = {}
+    for fmt in PACKAGE_FORMATS:
+        packages[fmt] = resp.get(fmt, {})
+        if PACKAGE_FORMAT_EXTS[fmt] == '.tar.bz2':
+            # Patch the repodata.json so that all package info dicts contain a "subdir"
+            # key.  Apparently some channels on anaconda.org do not contain the
+            # 'subdir' field. I think this this might be relegated to the
+            # Continuum-provided channels only, actually.
+            for pkg_name, pkg_info in packages[fmt].items():
+                pkg_info.setdefault('subdir', platform)
     return info, packages
 
 
@@ -543,11 +563,14 @@ def _list_conda_packages(local_dir):
 
     Returns
     -------
-    list
-        List of conda packages in `local_dir`
+    dict
+        Dict with keys in PACKAGE_FORMATS, Values are List of conda packages in `local_dir`
     """
     contents = os.listdir(local_dir)
-    return fnmatch.filter(contents, "*.tar.bz2")
+    matching_packages = {}
+    for fmt in PACKAGE_FORMATS:
+        matching_packages[fmt] = fnmatch.filter(contents, f"*{fmt}")
+    return matching_packages
 
 
 def _validate_packages(package_repodata, package_directory, num_threads=1):
@@ -584,15 +607,16 @@ def _validate_packages(package_repodata, package_directory, num_threads=1):
 
     # create argument list (necessary because multiprocessing.Pool.map does not
     # accept additional args to be passed to the mapped function)
-    num_packages = len(local_packages)
-    val_func_arg_list = [(package, num, num_packages, package_repodata,
-                          package_directory)
-                         for num, package in enumerate(sorted(local_packages))]
+    num_packages = {fmt: len(local_packages[fmt]) for fmt in PACKAGE_FORMATS}
+    val_func_arg_list = {fmt: [(package, num, num_packages[fmt], package_repodata[fmt],
+                         package_directory)
+                         for num, package in enumerate(sorted(local_packages[fmt]))]
+                         for fmt in PACKAGE_FORMATS}
 
     if num_threads == 1 or num_threads is None:
         # Do serial package validation (Takes a long time for large repos)
-        validation_results = map(_validate_or_remove_package,
-                                 val_func_arg_list)
+        validation_results = {fmt: map(_validate_or_remove_package,
+                              val_func_arg_list[fmt]) for fmt in PACKAGE_FORMATS}
     else:
         if num_threads == 0:
             num_threads = os.cpu_count()
@@ -600,11 +624,13 @@ def _validate_packages(package_repodata, package_directory, num_threads=1):
                          'cores: %s' % num_threads)
         logger.info('Will use {} threads for package validation.'
                     ''.format(num_threads))
-        p = multiprocessing.Pool(num_threads)
-        validation_results = p.map(_validate_or_remove_package,
-                                   val_func_arg_list)
-        p.close()
-        p.join()
+
+        for fmt in PACKAGE_FORMATS:
+            p = multiprocessing.Pool(num_threads)
+            validation_results[fmt] = p.map(_validate_or_remove_package,
+                                            val_func_arg_list[fmt])
+            p.close()
+            p.join()
 
     return validation_results
 
@@ -757,11 +783,11 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     # 8. download repodata.json and repodata.json.bz2
     # 9. copy new repodata.json and repodata.json.bz2 into the repo
     summary = {
-        'validating-existing': set(),
-        'validating-new': set(),
-        'downloaded': set(),
-        'blacklisted': set(),
-        'to-mirror': set()
+        'validating-existing': {fmt: set() for fmt in PACKAGE_FORMATS},
+        'validating-new': {fmt: set() for fmt in PACKAGE_FORMATS},
+        'downloaded': {fmt: set() for fmt in PACKAGE_FORMATS},
+        'blacklisted': {fmt: set() for fmt in PACKAGE_FORMATS},
+        'to-mirror': {fmt: set() for fmt in PACKAGE_FORMATS}
     }
     # Implementation:
     if not os.path.exists(os.path.join(target_directory, platform)):
@@ -778,28 +804,30 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     #                    num_threads=num_threads)
 
     # 2. figure out blacklisted packages
-    blacklist_packages = {}
-    whitelist_packages = {}
+    blacklist_packages = {fmt: {} for fmt in PACKAGE_FORMATS}
+    whitelist_packages = {fmt: {} for fmt in PACKAGE_FORMATS}
     # match blacklist conditions
     if blacklist:
-        blacklist_packages = {}
         for blist in blacklist:
             logger.debug('blacklist item: %s', blist)
             matched_packages = _match(packages, blist)
-            logger.debug(pformat(list(matched_packages.keys())))
-            blacklist_packages.update(matched_packages)
+            for fmt in PACKAGE_FORMATS:
+                logger.debug(pformat(list(matched_packages[fmt].keys())))
+                blacklist_packages[fmt].update(matched_packages[fmt])
 
     # 3. un-blacklist packages that are actually whitelisted
     # match whitelist on blacklist
     if whitelist:
-        whitelist_packages = {}
         for wlist in whitelist:
             matched_packages = _match(packages, wlist)
-            whitelist_packages.update(matched_packages)
+            for fmt in PACKAGE_FORMATS:
+                whitelist_packages[fmt].update(matched_packages[fmt])
     # make final mirror list of not-blacklist + whitelist
-    true_blacklist = set(blacklist_packages.keys()) - set(
-        whitelist_packages.keys())
-    summary['blacklisted'].update(true_blacklist)
+    true_blacklist = {fmt: {} for fmt in PACKAGE_FORMATS}
+    for fmt in PACKAGE_FORMATS:
+        true_blacklist[fmt] = (set(blacklist_packages[fmt].keys())
+                               - set(whitelist_packages[fmt].keys()))
+        summary['blacklisted'][fmt].update(true_blacklist[fmt])
 
     logger.info("BLACKLISTED PACKAGES")
     logger.info(pformat(true_blacklist))
@@ -807,30 +835,38 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     # Get a list of all packages in the local mirror
     if dry_run:
         local_packages = _list_conda_packages(local_directory)
-        packages_slated_for_removal = [
-            pkg_name for pkg_name in local_packages if pkg_name in summary['blacklisted']
-        ]
+        packages_slated_for_removal = {}
+        for fmt in PACKAGE_FORMATS:
+            packages_slated_for_removal[fmt] = [
+                pkg_name for pkg_name in local_packages[fmt]
+                if pkg_name in summary['blacklisted'][fmt]
+            ]
         logger.info("PACKAGES TO BE REMOVED")
         logger.info(pformat(packages_slated_for_removal))
 
-    possible_packages_to_mirror = set(packages.keys()) - true_blacklist
+    possible_packages_to_mirror = {fmt: set(packages[fmt].keys()) - true_blacklist[fmt]
+                                   for fmt in PACKAGE_FORMATS}
 
     # 4. Validate all local packages
     # construct the desired package repodata
-    desired_repodata = {pkgname: packages[pkgname]
-                        for pkgname in possible_packages_to_mirror}
+    desired_repodata = {fmt: {pkgname: packages[pkgname]
+                        for pkgname in possible_packages_to_mirror[fmt]}
+                        for fmt in PACKAGE_FORMATS}
     if not (dry_run or no_validate_target):
         # Only validate if we're not doing a dry-run
         validation_results = _validate_packages(desired_repodata, local_directory, num_threads)
-        summary['validating-existing'].update(validation_results)
+        for fmt in PACKAGE_FORMATS:
+            summary['validating-existing'][fmt].update(validation_results)
     # 5. figure out final list of packages to mirror
     # do the set difference of what is local and what is in the final
     # mirror list
     local_packages = _list_conda_packages(local_directory)
-    to_mirror = possible_packages_to_mirror - set(local_packages)
+    to_mirror = {fmt: possible_packages_to_mirror[fmt] - set(local_packages[fmt])
+                 for fmt in PACKAGE_FORMATS}
     logger.info('PACKAGES TO MIRROR')
     logger.info(pformat(sorted(to_mirror)))
-    summary['to-mirror'].update(to_mirror)
+    for fmt in PACKAGE_FORMATS:
+        summary['to-mirror'][fmt].update(to_mirror[fmt])
     if dry_run:
         logger.info("Dry run complete. Exiting")
         return summary
@@ -845,75 +881,86 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     download_url, channel = _maybe_split_channel(upstream_channel)
     with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
         logger.info('downloading to the tempdir %s', download_dir)
-        for package_name in sorted(to_mirror):
-            url = download_url.format(
-                channel=channel,
-                platform=platform,
-                file_name=package_name)
-            try:
-                # make sure we have enough free disk space in the temp folder to meet threshold
-                if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download.',
-                                 download_dir)
+        for fmt in PACKAGE_FORMATS:
+            for package_name in sorted(to_mirror[fmt]):
+                url = download_url.format(
+                    channel=channel,
+                    platform=platform,
+                    file_name=package_name)
+                try:
+                    # make sure we have enough free disk space in the temp folder to meet threshold
+                    if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
+                        logger.error('Disk space below threshold in %s. Aborting download.',
+                                     download_dir)
+                        break
+
+                    # download package
+                    total_bytes += _download_backoff_retry(url, download_dir,
+                                                           proxies=proxies,
+                                                           ssl_verify=ssl_verify,
+                                                           max_retries=max_retries)
+
+                    # make sure we have enough free disk space in the target folder
+                    # while also being able to fit the packages we have already downloaded
+                    free_space = shutil.disk_usage(local_directory).free
+                    if (free_space - total_bytes) < minimum_free_space_kb:
+                        logger.error('Disk space below threshold in %s. Aborting download',
+                                     local_directory)
+                        break
+
+                    summary['downloaded'][fmt].add((url, download_dir))
+                except Exception as ex:
+                    logger.exception('Unexpected error: %s. Aborting download.', ex)
                     break
-
-                # download package
-                total_bytes += _download_backoff_retry(url, download_dir,
-                                                       proxies=proxies,
-                                                       ssl_verify=ssl_verify,
-                                                       max_retries=max_retries)
-
-                # make sure we have enough free disk space in the target folder to meet threshold
-                # while also being able to fit the packages we have already downloaded
-                if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download',
-                                 local_directory)
-                    break
-
-                summary['downloaded'].add((url, download_dir))
-            except Exception as ex:
-                logger.exception('Unexpected error: %s. Aborting download.', ex)
-                break
 
         # validate all packages in the download directory
+        # TODO: Check whether this should check the pkgs in to_mirror,
+        # rather than those in packages
         validation_results = _validate_packages(packages, download_dir,
                                                 num_threads=num_threads)
-        summary['validating-new'].update(validation_results)
+
+        for fmt in PACKAGE_FORMATS:
+            summary['validating-new'][fmt].update(validation_results[fmt])
         logger.debug('Newly downloaded files at %s are %s',
                      download_dir,
                      pformat(os.listdir(download_dir)))
 
         # 8. Use already downloaded repodata.json contents but prune it of
         # packages we don't want
-        repodata = {'info': info, 'packages': packages}
+        new_repodata = {'info': info}
 
         # compute the packages that we have locally
-        packages_we_have = set(local_packages +
-                               _list_conda_packages(download_dir))
+        downloaded_packages = _list_conda_packages(download_dir)
+        packages_we_have = {fmt: set(local_packages[fmt] + downloaded_packages[fmt])
+                            for fmt in PACKAGE_FORMATS}
+
         # remake the packages dictionary with only the packages we have
         # locally
-        repodata['packages'] = {
-            name: info for name, info in repodata['packages'].items()
-            if name in packages_we_have}
-        _write_repodata(download_dir, repodata)
+        for fmt in PACKAGE_FORMATS:
+            new_repodata[fmt] = {
+                name: info for name, info in new_repodata[fmt].items()
+                if name in packages_we_have[fmt]}
+
+        _write_repodata(download_dir, new_repodata)
 
         # move new conda packages
-        for f in _list_conda_packages(download_dir):
-            old_path = os.path.join(download_dir, f)
-            new_path = os.path.join(local_directory, f)
-            logger.info("moving %s to %s", old_path, new_path)
-            shutil.move(old_path, new_path)
+        for fmt in PACKAGE_FORMATS:
+            for f in _list_conda_packages(download_dir)[fmt]:
+                old_path = os.path.join(download_dir, f)
+                new_path = os.path.join(local_directory, f)
+                logger.info("moving %s to %s", old_path, new_path)
+                shutil.move(old_path, new_path)
 
-        for f in ('repodata.json', 'repodata.json.bz2'):
-            download_path = os.path.join(download_dir, f)
-            move_path = os.path.join(local_directory, f)
-            shutil.move(download_path, move_path)
+            for f in ('repodata.json', 'repodata.json.bz2'):
+                download_path = os.path.join(download_dir, f)
+                move_path = os.path.join(local_directory, f)
+                shutil.move(download_path, move_path)
 
     # Also need to make a "noarch" channel or conda gets mad
     noarch_path = os.path.join(target_directory, 'noarch')
     if not os.path.exists(noarch_path):
         os.makedirs(noarch_path, exist_ok=True)
-        noarch_repodata = {'info': {}, 'packages': {}}
+        noarch_repodata = {'info': {}, 'packages': {}, 'packages.conda': {}}
         _write_repodata(noarch_path, noarch_repodata)
 
     return summary
